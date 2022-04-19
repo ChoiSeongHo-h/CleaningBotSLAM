@@ -1,0 +1,4 @@
+<launch>
+    <node name="vins_estimator" pkg="vins" type="vins_node" respawn="true" args="/home/csh/catkin_ws/src/VINS_Lite_GPU/config/test/mono_imu_config.yaml" output="screen"> </node>
+</launch>
+

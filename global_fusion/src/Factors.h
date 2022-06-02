@@ -12,6 +12,8 @@
 #pragma once
 #include <ceres/ceres.h>
 #include <ceres/rotation.h>
+#include <Eigen/Geometry>
+#include <Eigen/Dense>
 
 template <typename T> inline
 void QuaternionInverse(const T q[4], T q_inverse[4])
@@ -48,6 +50,47 @@ struct TError
 	double t_x, t_y, t_z, var;
 
 };
+
+
+struct QError
+{
+	QError(double yaw, double qVar)
+				  :yaw(yaw), qVar(qVar){}
+
+	template <typename T>
+	bool operator()(const T* worldQ, T* residuals) const
+	{
+	    auto headingQ = Eigen::AngleAxis<T>(T(yaw-1.5708), Eigen::Matrix<T, 3, 1>::UnitZ())
+	        * Eigen::AngleAxis<T>(T(-1.5708), Eigen::Matrix<T, 3, 1>::UnitY())
+	        * Eigen::AngleAxis<T>(T(1.5708), Eigen::Matrix<T, 3, 1>::UnitX());
+
+		T invHeadingQ[4];
+		invHeadingQ[0] = headingQ.w();
+		invHeadingQ[1] = -headingQ.x();
+		invHeadingQ[2] = -headingQ.y();
+		invHeadingQ[3] = -headingQ.z();
+
+		T errorQ[4];
+		ceres::QuaternionProduct(invHeadingQ, worldQ, errorQ); 
+
+		residuals[0] = T(2) * errorQ[1] / T(qVar);
+		residuals[1] = T(2) * errorQ[2] / T(qVar);
+		residuals[2] = T(2) * errorQ[3] / T(qVar);
+
+		return true;
+	}
+
+	static ceres::CostFunction* Create(const double yaw, const double qVar) 
+	{
+	  return (new ceres::AutoDiffCostFunction<
+	          QError, 3, 4>(
+	          	new QError(yaw, qVar)));
+	}
+
+	double yaw, qVar;
+
+};
+
 
 struct RelativeRTError
 {
@@ -91,9 +134,9 @@ struct RelativeRTError
 		T error_q[4];
 		ceres::QuaternionProduct(relative_q_inv, q_i_j, error_q); 
 
-		residuals[3] = T(2) * error_q[1] / T(q_var) *0.85;
-		residuals[4] = T(2) * error_q[2] / T(q_var) *0.85;
-		residuals[5] = T(2) * error_q[3] / T(q_var) *0.85;
+		residuals[3] = T(2) * error_q[1] / T(q_var);
+		residuals[4] = T(2) * error_q[2] / T(q_var);
+		residuals[5] = T(2) * error_q[3] / T(q_var);
 
 		return true;
 	}

@@ -16,6 +16,9 @@ GlobalOptimization::GlobalOptimization()
 {
 	initGPS = false;
     newGPS = false;
+    N_MAX_GPS_WINDOWS = 6;
+    TH_MIN_EIGEN_RATIO = 50;
+    decayFactor = -0.2*log(2.0);
 	WGPS_T_WVIO = Eigen::Matrix4d::Identity();
     threadOpt = std::thread(&GlobalOptimization::optimize, this);
 }
@@ -83,8 +86,167 @@ void GlobalOptimization::inputGPS(double t, double latitude, double longitude, d
 	vector<double> tmp{xyz[0], xyz[1], xyz[2], posAccuracy};
     //printf("new gps: t: %f x: %f y: %f z:%f \n", t, tmp[0], tmp[1], tmp[2]);
 	GPSPositionMap[t] = tmp;
+    EstimateGPSHeading(t);
     newGPS = true;
 
+}
+
+
+void GlobalOptimization::EstimateGPSHeading(double t)
+{
+    mPoseMap.lock();
+    // no VI data
+    if(globalPoseMap.size() < 1)
+    {
+        mPoseMap.unlock();
+        return;
+    }
+
+    // if 1 or 2 gps point :
+    if(GPSPositionMap.size() < 3)
+    {
+        // new gps(reset)
+        if(GPSPositionMap.size() == 1)
+        {
+            GPSHeadingMap.clear();
+        }
+        mPoseMap.unlock();
+        return;
+    }
+   
+    // calc cov, stdv
+    vector<double> vX, vY, vSquaredDiffX, vSquaredDiffY, vCrossDiffXY;
+    vX.reserve(N_MAX_GPS_WINDOWS);
+    vY.reserve(N_MAX_GPS_WINDOWS);
+    vSquaredDiffX.reserve(N_MAX_GPS_WINDOWS);
+    vSquaredDiffY.reserve(N_MAX_GPS_WINDOWS);
+    vCrossDiffXY.reserve(N_MAX_GPS_WINDOWS);
+    // latest element
+    auto iterGPS = GPSPositionMap.find(t);
+    // copy max 5 before GPS point (total 6 windows elements)
+    for(int nIter = 0; (nIter<N_MAX_GPS_WINDOWS) && (iterGPS != GPSPositionMap.begin()); nIter++, iterGPS--)
+    {
+        // new -> old order save
+        vX.emplace_back(iterGPS->second[0]);
+        vY.emplace_back(iterGPS->second[1]);
+    }
+
+    double meanX = accumulate(vX.begin(), vX.end(), 0.0)/vX.size();
+    double meanY = accumulate(vY.begin(), vY.end(), 0.0)/vY.size();
+    // calc squared diff
+    for(int i = 0; i<vX.size(); i++)
+    {
+        vSquaredDiffX.emplace_back(vX[i]-meanX);
+        vSquaredDiffY.emplace_back(vY[i]-meanY);
+        vCrossDiffXY.emplace_back(vSquaredDiffX[i]*vSquaredDiffY[i]);
+        vSquaredDiffX[i] = pow(vSquaredDiffX[i], 2);
+        vSquaredDiffY[i] = pow(vSquaredDiffY[i], 2);
+    }
+
+    // calc varince for axis
+    double sxx = accumulate(vSquaredDiffX.begin(), vSquaredDiffX.end(), 0.0)/vSquaredDiffX.size();
+    double syy = accumulate(vSquaredDiffY.begin(), vSquaredDiffY.end(), 0.0)/vSquaredDiffY.size();
+    double sxy = accumulate(vCrossDiffXY.begin(), vCrossDiffXY.end(), 0.0)/vCrossDiffXY.size();
+
+    // if no moving
+    double stdv = sqrt(sxx+syy);
+    if(stdv<1.5)
+    {
+        mPoseMap.unlock();
+        return;
+    }
+
+    // calc cov
+    Eigen::Matrix<double, 2, 2> cov;
+    cov << sxx, sxy, sxy, syy;
+    Eigen::EigenSolver<Eigen::Matrix<double, 2,2> > es(cov);
+    auto eigenvalues = es.eigenvalues();
+    auto eigenvectors = es.eigenvectors();
+    uint32_t majorIdx = 0;
+    // set major idx by major eigenvalue
+    if (eigenvalues[1].real() > eigenvalues[0].real())
+        majorIdx = 1;
+    // PCA -> if major axies have low eigenvalue scale
+    if(eigenvalues[majorIdx].real() <= 0.0001)
+    {
+        mPoseMap.unlock();
+        return;
+    }
+    double eigenratio = eigenvalues[majorIdx].real()/eigenvalues[!majorIdx].real();
+    // if nonlinear
+    if(eigenratio<TH_MIN_EIGEN_RATIO)
+    {
+        mPoseMap.unlock();
+        return;
+    }
+    //normalized major eigenvetor components
+    double normalMajorEVecX = eigenvectors(0, majorIdx).real();
+    double normalMajorEVecY = eigenvectors(1, majorIdx).real();
+    // eigenvector normalization
+    double len = sqrt(pow(normalMajorEVecX, 2)+pow(normalMajorEVecY, 2));
+    normalMajorEVecX /= len;
+    normalMajorEVecY /= len;
+
+    // calc direction
+    double normalDirX = 0.0;
+    double normalDirY = 0.0;
+    for(int i = 0; i < vX.size()-1; i++)
+    {
+        //new -> old order search
+        double partialDx = double(vX[i]-vX[i+1]);
+        double partialDy = double(vY[i]-vY[i+1]);
+        double partialLen = sqrt(pow(partialDx, 2)+pow(partialDy, 2));
+        if(partialLen == 0)
+            continue;
+        normalDirX += partialDx/partialLen;
+        normalDirY += partialDy/partialLen;
+    }
+    len = sqrt(pow(normalDirX, 2)+pow(normalDirY, 2));
+    if(len<0.00001)
+    {
+        mPoseMap.unlock();
+        return;
+    }
+    normalDirX /= len;
+    normalDirY /= len;
+    double dot = normalMajorEVecX*normalDirX+normalMajorEVecY*normalDirY;
+    // if has opposite direction -> correct
+    if(dot<0)
+    {
+        normalMajorEVecX = -normalMajorEVecX;
+        normalMajorEVecY = -normalMajorEVecY;
+    }
+
+    double yaw = atan2(normalMajorEVecY, normalMajorEVecX);
+    //yaw stdv func
+    double yawStdv = 15.0/(0.04*eigenratio-1)*M_PI/180.0;
+    auto q = Eigen::AngleAxisd(0.0, Eigen::Vector3d::UnitX())
+        * Eigen::AngleAxisd(0.0, Eigen::Vector3d::UnitY())
+        * Eigen::AngleAxisd(yawStdv, Eigen::Vector3d::UnitZ());
+    double qStdv = pow(q.z(), 2);
+    
+    iterGPS = GPSPositionMap.find(t);
+    auto iterPose = globalPoseMap.find(t);
+    for(int i = 0; i<N_MAX_GPS_WINDOWS && iterGPS!=GPSPositionMap.begin() && iterPose!=globalPoseMap.begin(); i++, iterGPS--, iterPose--)
+    {
+        auto iterT = iterGPS->first;
+        // already has gps yaw
+        if(GPSHeadingMap.find(iterT) != GPSHeadingMap.end())
+            continue;
+        
+        // calc has roll, pitch close to 0
+        auto originVerticalAxis = Eigen::Vector3d(0.0, 0.0, 1.0);
+        auto poseQuat = Eigen::Quaterniond(iterPose->second[3], iterPose->second[4], iterPose->second[5], iterPose->second[6]);
+        auto imuVerticalAxis = poseQuat.toRotationMatrix()*Eigen::Vector3d(1.0, 0.0, 0.0);
+        double dot = imuVerticalAxis.dot(originVerticalAxis);
+
+        // if nGPS -> inf, assistant -> 0
+        double assistant = exp(decayFactor*GPSHeadingMap.size());
+        double accuracy = std::max(dot, assistant);
+        
+        GPSHeadingMap[iterT] = pair<double, double>(yaw, qStdv/accuracy);
+    }
+    mPoseMap.unlock();
 }
 
 void GlobalOptimization::optimize()
@@ -210,6 +372,12 @@ void GlobalOptimization::optimize()
                     */
                 }
 
+                auto iterGPSHeading = GPSHeadingMap.find(t);
+                if(iterGPSHeading != GPSHeadingMap.end())
+                {
+                    ceres::CostFunction* GPSHeadingCost = QError::Create(iterGPSHeading->second.first, iterGPSHeading->second.second);
+                    problem.AddResidualBlock(GPSHeadingCost, NULL, q_array[i]);
+                }
             }
             //mPoseMap.unlock();
             ceres::Solve(options, &problem, &summary);

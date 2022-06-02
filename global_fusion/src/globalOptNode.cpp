@@ -24,6 +24,8 @@
 #include <queue>
 #include <mutex>
 #include <std_msgs/Bool.h>
+#include <tf/transform_broadcaster.h>
+#include <std_srvs/Empty.h>
 
 struct Point
 {
@@ -36,6 +38,7 @@ int nFail = 0;
 
 GlobalOptimization globalEstimator;
 ros::Publisher pub_global_odometry, pub_global_path, pub_car, marker_pub, reset_pub;
+ros::ServiceClient resetClient;
 nav_msgs::Path *global_path;
 double last_vio_t = -1;
 std::queue<sensor_msgs::NavSatFixConstPtr> gpsQueue;
@@ -182,13 +185,46 @@ void vio_callback(const nav_msgs::Odometry::ConstPtr &pose_msg)
     odometry.pose.pose.orientation.z = global_q.z();
     odometry.pose.pose.orientation.w = global_q.w();
     pub_global_odometry.publish(odometry);
+
+    static tf::TransformBroadcaster br;
+    // imu coordinate
+    tf::Transform transform0;
+    tf::Quaternion q0;
+    transform0.setOrigin(tf::Vector3(global_t.x(), global_t.y(), global_t.z()));
+    q0.setW(global_q.w());
+    q0.setX(global_q.x());
+    q0.setY(global_q.y());
+    q0.setZ(global_q.z());
+    transform0.setRotation(q0);
+
+    // imu to camera coordinate
+    tf::Quaternion q1;
+    q1.setW(0.7071068);
+    q1.setX(0.0);
+    q1.setY(0.0);
+    q1.setZ(-0.7071068);
+    tf::Transform transform1(q1, tf::Vector3(-0.01375681, 0.00598896, -0.03784183));
+
+    transform0 = transform0*transform1;
+
+    // camera to octomap coordinate
+    q1.setW(0.5);
+    q1.setX(0.5);
+    q1.setY(-0.5);
+    q1.setZ(0.0);
+    transform1 = tf::Transform(q1, tf::Vector3(0.0, 0.0, 0.0));
+
+    transform0 = transform0*transform1;
+
+    br.sendTransform(tf::StampedTransform(transform0, ros::Time::now(), "world", "_link"));
+
     double res = sqrt(pow(xyz[0]-odometry.pose.pose.position.x, 2)+pow(xyz[1]-odometry.pose.pose.position.y, 2)+pow(xyz[2]-odometry.pose.pose.position.z, 2));
     //cout<< "res : " << res <<endl;
-    if(res>50)
+    if(res>30)
       nFail++;
     else if(nFail>0)
       nFail--;      
-    if(nFail>3)
+    if(nFail>4)
     {
       printf("fail\n");
       nFail = 0;
@@ -198,6 +234,8 @@ void vio_callback(const nav_msgs::Odometry::ConstPtr &pose_msg)
       globalEstimator.localPoseMap.clear();
       globalEstimator.globalPoseMap.clear();
       globalEstimator.GPSPositionMap.clear();
+      std_srvs::Empty srv;
+      resetClient.call(srv);
     }
     pub_global_path.publish(*global_path);
     //publish_car_model(t, global_t, global_q);
@@ -233,7 +271,8 @@ int main(int argc, char **argv)
     pub_car = n.advertise<visualization_msgs::MarkerArray>("car_model", 1000);
     marker_pub = n.advertise<visualization_msgs::MarkerArray>("marker/node", 1000);
     reset_pub = n.advertise<std_msgs::Bool>("fail", 100);
-    
+    resetClient = n.serviceClient<std_srvs::Empty>("/octomap_server/reset");
+
     ros::spin();
     return 0;
 }

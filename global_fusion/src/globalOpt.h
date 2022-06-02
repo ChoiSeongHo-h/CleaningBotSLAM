@@ -39,10 +39,13 @@ public:
 	map<double, vector<double>> localPoseMap;
 	map<double, vector<double>> globalPoseMap;
 	map<double, vector<double>> GPSPositionMap;
+	// format t, (yaw, quaternion var)
+	map<double, pair<double, double>> GPSHeadingMap;
 
 private:
 	void optimize();
 	void updateGlobalPath();
+	void EstimateGPSHeading(double t);
 
 	bool initGPS;
 	bool newGPS;
@@ -52,5 +55,8 @@ private:
 	Eigen::Vector3d lastP;
 	Eigen::Quaterniond lastQ;
 	std::thread threadOpt;
+	uint32_t N_MAX_GPS_WINDOWS;
+	double TH_MIN_EIGEN_RATIO;
+	double decayFactor;
 
 };

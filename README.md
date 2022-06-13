@@ -1,31 +1,167 @@
-# VINS_Lite_GPU
+6DOF GNSS + VI 추정기인 vins fusion gpu을 수상 로봇청소기에 맞게 수정한 버전이다.
 
-VINS FUSION GPU lite version. 
+https://github.com/KopiSoftware/VINS_Lite_GPU <- 특히 이 라이트버전을 사용하였다.
+(글로벌 퓨전이 안 돼서 글로벌 퓨전은 원본을 사용하였다.)
 
---- 
+VINS fusion은 loosely coupled gps, tightly coupled Visual-Inertial 시스템이다.
 
-## Our works
+원본은 비록 GPU를 사용한다 하더라도, 코너 검출과 옵티컬 플로우와 같은 영상처리에만 가속을 사용한다.
 
-- Memory leak problem is fixed. 
-- We trained a DBOW vocabulary with LIP6Indoor dataset. This model achieves 95% of the performance of the original model, and much smaller.
-- We have test this model on Nvidia Jetson Nano 2GB version with MYNTEYE s1030-ir. The RAM consumption is about 60MB when program starts up. The usage of RAM will increase with the number of keyframe or running time. The GPU consumption is about 20%.  
+우리의 시스템은 젯슨 나노를 사용하고 CPU쪽에 병목현상이 심해 실시간성이 보장되지 않는다.
 
-![vins_lite_gpu-2](https://user-images.githubusercontent.com/17807222/124372174-6c5d9700-dcbb-11eb-8bec-cb5755701528.png)
+따라서 기본적으로 ceres 2버전부터 지원되는 쿠다 가속을 이용했고, 버퍼를 수정하여 최근 1개의 이미지만을 저장하도록 수정하였다.
 
----
+이미지 프로세싱과 최적화를 gpu에서 수행하니 확실히 성능이 개선되었다.
 
-## Performance
-It can be very easy to reach 30fps on Jetson Nano 2GB with half feature number cut down. Please check the pose_graph in RVIZ rather than tracking image view. The pose_graph is realtime, but the tracking image view has a serious delay. Here is my configuration:
-```yaml
-multiple_thread: 4
-max_cnt: 75
-freq: 30                # frequence (Hz) of publish tracking result. At least 10Hz for good estimation.
-max_solver_time: 0.02  # max solver itration time (ms), to guarantee real time
-max_num_iterations: 4   # max solver itrations, to guarantee real time
-```
+한편, gps를 사용하여 글로벌 일관성이 보장되었기 때문에 loop fusion node는 제거하였다.
 
-## Installation
-Please follow original [VINS FUSION GPU](https://github.com/pjrambo/VINS-Fusion-gpu). The installation process is identical. You may need vitrual memory to compile the program.
+이것도 실시간성을 위한 타협이다.
 
-## Acknowledgment
-The Jetson devices in our experiment is supported by NVIDIA Jetson Nano 2GB Developer Kit Grant Program
+IMU 모델링 계수, 카메라 파라미터, 두 센서의 싱크. 모두 심혈을 기울여 보정하였으나 IMU에 의해 매우 큰 드리프트가 발생한다.
+
+이는 VI-Stereo-DSO를 사용해도 마찬가지였다. IMU에 대한 문제가 심각하였다.
+
+특히 가속도계 바이어스에서 그 문제가 두드러졌고, 이는 속도와 위치 모두 악영향을 끼쳤다.
+
+위 문제는 최적화 상에서의 문제라는 생각이 들었다.
+
+VINS fusion은 열악한 imu에 대해 bias에 대한 최적화 제약조건이 모자라다고 생각된다. 
+
+왜냐하면 시간이 지날수록 바이어스에 대한 공분산만 커지고, 바이어스의 절대적인 크기에 대한 제약은 없기 때문이다.
+(엄밀히 말하면 이전과 크기가 같다는 제약이 있다.)
+
+이 때문에 바이어스가 다른 스테이트에 의해 결정되고, 틀어진다고 생각하였다.(매니폴드에서 벗어남)
+
+이를 해결하기 위해 imu 바이어스에 대한 제약조건을 추가하였다.
+
+우선 바이어스는 가우시안 분포를 띄고 특정 값 주변에서 천천히 진동한다는 가정을 하였다.
+
+이를 위해 imu 측정을 20개 단위로 묶어서 구한 평균을 전체 평균에서 빼어 이를 바이어스로 가정하였다.
+(클러스터링의 이유는 노이즈를 없애기 위함이다.)
+
+20개씩 클러스터링한 것과 전체 평균의 차이는 0에 대해 정규분포를 띄고 있을 확률이 높을 것이라고 생각했기 때문이다.
+(실제 T분포에서 20개 정도면 정규분포와 유사하다.)
+
+그렇게 노이즈 크기의 평균과 분산을 구하였고 세 축 바이어스 크기가 구한 평균에 가깝도록 손실함수를 구성하였다.
+
+자코비안은 다음과 같이 구성되었는데,
+![화면 캡처 2022-06-14 014404](https://user-images.githubusercontent.com/72921481/173403588-18c2b65f-04c0-45d7-b211-df186b98af93.jpg)
+
+테스트 케이스에서 이는 수치적으로 매우 불안정하였다.
+
+어느 축하나만 커져도 세 축에대해 보정할 수 있어서 어느 축이 커져야 할지 결정하지 못하기 때문이다.
+(x축만 변화해도 정규분포를 따르는 크기에 도달할 수 있다. convex가 아니다?)
+
+즉, 축마다의 제약조건이 모자라다는 생각이 들었다.
+
+그래서 전체 바이어스의 크기를 제약조건으로 두는 것이 아니라, 축마다 바이어스의 크기를 제약조건으로 두기로하였다.
+
+각 축마다 구한 바어이스의 마할라노비스 거리를 최소화한다.
+(vins fusion의 다른 loss 텀과 차원을 맞추기 위함이다.)
+
+하지만 여전히 문제가 심각했다. 따라서 imu의 신뢰도를 낮추기로 결정하였다.
+
+imu 최적화 iter시마다 0.9의 감쇄계수를 넣어 imu의 초기 러프한 추적만 믿고 이후는 믿지 않도록 했다.
+
+또한 속도의 발산을 막으려 하였다.
+
+imu의 속도 관측의 분산은 imu의 랜덤 노이즈에 의해 전파된다. 그래서 칼리브레이션 값보다 일정 수준 공분산을 높였다.
+
+추가적으로 카메라 워크상 두 포즈의 변위를 미분하여 이를 스테이트의 속도와 같게끔 하기로 마음먹었다.
+
+어차피 SE(3) 상에서는 두 포즈간 등속도를 가정하기 때문이다.
+
+그러나, imu텀과 cam텀은 스테이트를 공유하고,
+
+속도의 변위전파 항도 포함하기 때문에 이는 의미없다고 판단하여 넣지 않았다.
+
+즉, 미분하여 imu의 속도와 비교하나, imu를 적분하여 카메라의 포즈와 비교하나 같다고 생각했기 때문이다.
+
+위 과정을 통해 imu를 퓨전하여 좋은 결과를 얻을 수 있었다.
+
+gps를 통해 고도를 얻을 수 있는데, 이는 매우 부정확하다
+
+우리 로봇의 바다에서 움직인다는 특성을 고려해 gps 고도를 0으로 고정하였다.
+
+고도가 0인 것의 공분산을 크게 주어 vi시스템의 단기적인 고도변화를 잘 반영하면서 드리프트를 없앤다.
+
+추가적으로 gps를 사용하여 vi 시스템을 자동 초기화할 수 있게 시스템을 구성하였다.
+
+gps의 좌표와 fusion 좌표의 차가 크게 날때 매니폴드에서 벗어난 것을 인식하고 시스템을 초기화한다.
+
+gps와 imu로 x, y, pitch, roll의 글로벌 일관성을, 로스함수의 수정으로 z의 일관성을 얻었다.
+
+마지막으로 요의 드리프트가 문제된다.
+
+우리 로봇의 특성상 바람이나 물의 영향이 있긴 하나, 웬만해서는 변위의 방향이 로봇의 헤딩 방향이다.
+
+일련의 GPS 측정들이 한 선상에 있을 때의 방향을 헤딩 factor로 사용하였다.
+
+비선형적인 움직임일 때의 움직임도 물론 헤딩 방향으로 사용 가능하겠지만,
+
+GPS는 관측간 텀이 길고 측정 오차가 크기 때문에. 여러 GPS 측정을 기준으로만 헤딩을 추정한다.
+
+먼저 GPS sliding window 원소들의 x분산, y분산 공분산을 구한다.
+
+x분산, y분산을 통해 표준편차를 구하고, 이것이 특정 미만이면(잘 움직이지 않는다면) 이 데이터를 사용하지 않는다.
+
+즉 선형적인 움직임과 더불어 일정한 속도가 보장되어야 한다.
+
+바람과 물살등에 의한 영향을 최소화 하는 것이다.
+
+이후 공분산을 기반으로 PCA를 수행한다.
+
+주축방향의 성분이 부축방향의 성분보다 매우 크다면 이 주축 방향을 사용한다.
+(선형회귀를 통한 방향을 사용할 수 있겠지만, x/y대칭적이지 않기 때문에 PCA를 통한 축을 사용한다.)
+
+주축방향이 결정되면 음의뱡향인지 양의 방향인지 결정한다.
+
+gps 윈도우 각 요소간(piecewise)의 움직임벡터를 정규화한 뒤 이들을 합친 것과 주축의 방향을 비교한다.(내적)
+
+이를 통해 매우 강인한 방향 추정이 가능하다.
+
+한편, (주축 eigenvalue)/(부축 eigenvalue)를 eigenratio로 정의한다.
+
+주축 방향으로 상대적으로 늘어난 정도를 의미한다.
+
+eigenratio를 heading의 공분산을 구한다. 가정한 공식은 다음과 같다 :
+
+![화면 캡처 2022-06-14 020345](https://user-images.githubusercontent.com/72921481/173406892-0c0c9bba-4565-41b4-ac30-d41821660bdd.jpg)
+
+eigenration가 1이면 공분산은 무한이 치솓고(주축과 부축의 크기가 같으므로)
+
+커질수록 작은 공분산을 갖는다.
+
+즉, 움직임이 크고 선형적일 때 공분산이 작아진다.
+
+위 과정을 통해 공분산과 방향을 정했다.
+
+추가적으로 roll과 pitch가 작을때에만 위 추정을 신뢰한다.(뒤틀림이 적을 때)
+
+자코비안은 autodiff를 이용한다.
+
+이를 탑재한 로봇은 에리카 공학교육 혁신센터 캡스톤 대상(1등)을 받았다.
+
+SLAM 영상 : https://www.youtube.com/watch?v=CH1DeH8SLzg
+
+-> 포인트 클라우드는 무관하다.
+-> 왼쪽 이미지는 rgbd 포인트 클라우드를 기반으로 dense mapping / 2d화 시킨 것이다.
+
+로봇 시연 영상 : https://studio.youtube.com/video/Qqig8yXCvjw/edit
+
+![2022_capstone_BWW_2_0_복사본-001](https://user-images.githubusercontent.com/72921481/173407500-e30a7176-7d6f-45de-893b-14dd2e777d9e.png)
+
+![캡스톤-최종-ppt-_page-0001](https://user-images.githubusercontent.com/72921481/173407728-d1754e88-034b-4e4e-bf9a-007004806603.jpg)
+![캡스톤-최종-ppt-_page-0002](https://user-images.githubusercontent.com/72921481/173407738-4ff92026-cf65-4440-a846-8e588ee1de9f.jpg)
+![캡스톤-최종-ppt-_page-0003](https://user-images.githubusercontent.com/72921481/173407739-12d6db74-ee7f-4366-9bff-51f14a0bca73.jpg)
+![캡스톤-최종-ppt-_page-0004](https://user-images.githubusercontent.com/72921481/173407742-3ace72c9-1d06-43af-8ef6-bd5b5e0aeee9.jpg)
+![캡스톤-최종-ppt-_page-0005](https://user-images.githubusercontent.com/72921481/173407744-85108984-7d93-4752-9ca4-8d04842628a1.jpg)
+![캡스톤-최종-ppt-_page-0006](https://user-images.githubusercontent.com/72921481/173407748-52ad4a46-3ffb-430d-93a4-9a133ec0e867.jpg)
+![캡스톤-최종-ppt-_page-0007](https://user-images.githubusercontent.com/72921481/173407750-05c13727-a0c0-432e-8e68-193b9ffac506.jpg)
+![캡스톤-최종-ppt-_page-0008](https://user-images.githubusercontent.com/72921481/173407756-85d2075c-06e0-4d98-9d64-617167da3e6c.jpg)
+![캡스톤-최종-ppt-_page-0009](https://user-images.githubusercontent.com/72921481/173407758-291c3a33-d720-4184-b97d-56ee52a46103.jpg)
+![캡스톤-최종-ppt-_page-0010](https://user-images.githubusercontent.com/72921481/173407762-736622e1-ac05-46c4-baa9-f67e02202418.jpg)
+
+
+
+
